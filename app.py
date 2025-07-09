@@ -58,12 +58,20 @@ def pinecone_search(query):
 
 # Define the function to handle general conversation using GPT-4
 def openai_conversation_responder(query):
-    response = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[{"role": "system", "content": "You are a friendly assistant."},
-                  {"role": "user", "content": query}]
-    )
-    return response.choices[0].message.content
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are UNILORIN Student Support, an IT support assistant for University of Ilorin students. Provide helpful, professional responses about university matters."},
+                {"role": "user", "content": query}
+            ],
+            max_tokens=300,  # Limit response length
+            temperature=0.7  # Lower temperature for more consistent responses
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI API error: {e}")
+        return "I'm having trouble accessing my knowledge base right now. Please try again shortly."
 
 tools = [
     Tool(
@@ -78,37 +86,29 @@ tools = [
     )
 ]
 
-# Set up the base template
-template = """
-I am UNILORIN Student Support, an AI assistant developed by Abdurrahman Abdulsalam from the Department of Information Technology. I provide 24/7 support for University of Ilorin students with academic, technical, and campus-related matters.
+# Improve the template to be more direct and less prone to loops
+template = """I am UNILORIN Student Support, developed by Abdurrahman Abdulsalam from IT Department.
 
-**CORE IDENTITY & PURPOSE:**
-- Name: UNILORIN Student Support
-- Primary Focus: IT support, academic guidance, and general student assistance
-- Developer: Abdurrahman Abdulsalam (400L IT student, 2024 set)
-- Mission: Help UNILORIN students with IT support and related issues
+IDENTITY: UNILORIN Student Support - IT and student guidance assistant
 
-**WHEN ASKED ABOUT CAPABILITIES:**
-Always respond with: "I am UNILORIN Student Support. I can help you with IT issues, academic procedures, campus information, student services, and general university guidance. What specific area would you like assistance with?"
-
-**SCOPE:** University of Ilorin student matters only. For unrelated topics, politely redirect to university-related questions.
-
-**RESPONSE STYLE:** Professional, helpful, first-person ("I can help you...", "Let me assist you...").
+RULES:
+1. For capability/identity questions: Answer directly without tools
+2. For specific questions: Use ONE appropriate tool
+3. Always start Final Answer with "I am UNILORIN Student Support"
+4. Keep responses concise and helpful
 
 Available tools: {tools}
-Previous conversation: {history}
-Student Question: {input}
+History: {history}
+Question: {input}
 
-IMPORTANT: For capability questions ("what can you do", "who are you", etc.), directly provide my identity and services without using tools.
+Think step by step:
+Thought: [Quick analysis - is this capability question or needs tool?]
+Action: [ONE tool name from: {tool_names}] OR [Skip if capability question]
+Action Input: [Specific query]
+Observation: [Tool result]
+Final Answer: I am UNILORIN Student Support. [Your helpful response]
 
-Thought: [Analyze if this needs tool assistance or direct response]
-Action: [Choose from: {tool_names}] OR provide direct response for basic questions
-Action Input: [specific query for tool]
-Observation: [tool result]
-Final Answer: [My response as UNILORIN Student Support]
-
-{agent_scratchpad}
-"""
+{agent_scratchpad}"""
 
 # Set up a prompt template
 class CustomPromptTemplate(StringPromptTemplate):
@@ -170,11 +170,15 @@ agent = LLMSingleActionAgent(
 
 memory = ConversationBufferWindowMemory(k=2)
 
+# Add timeout and iteration limits to prevent infinite loops
 agent_executor = AgentExecutor.from_agent_and_tools(
     agent=agent,
     tools=tools,
     verbose=True,
-    memory=memory
+    memory=memory,
+    max_iterations=3,  # Limit to 3 iterations
+    max_execution_time=25,  # 25 second timeout
+    early_stopping_method="generate"
 )
 
 def get_user_memory(user_id):
@@ -183,21 +187,9 @@ def get_user_memory(user_id):
         user_memories[user_id] = ConversationBufferWindowMemory(k=2)
     return user_memories[user_id]
 
-async def async_run_llm_agent(query):
-    try:
-        output = await agent_executor.arun({"input": query})
-        return {"output": output}
-    except Exception as e:
-        print(f"Error in async_run_llm_agent: {e}")
-        return {"output": "An error occurred while processing your request."}
-
-
-@app.route('/')
-def home():
-    return "Hi! I'm Unilorin Student Support. How can I help you today?"
-
+# Remove async - Flask doesn't handle async well without additional setup
 @app.route('/api/chat', methods=['POST'])
-async def chat():
+def chat():
     data = request.json
     user_query = data.get("message", "")
     user_id = data.get("user_id")
@@ -205,22 +197,71 @@ async def chat():
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
     
-    user_memory = get_user_memory(user_id)  # Get or initialize memory for the user
+    if not user_query or len(user_query.strip()) == 0:
+        return jsonify({"error": "Message cannot be empty"}), 400
     
-    # Create a temporary AgentExecutor with the user's memory
+    # Handle capability questions directly to avoid agent loops
+    capability_keywords = [
+        "what can you do", "who are you", "what are you", 
+        "tell me about yourself", "your capabilities", "your name",
+        "what is your name", "introduce yourself"
+    ]
+    
+    if any(keyword in user_query.lower() for keyword in capability_keywords):
+        response = "I am UNILORIN Student Support. I can help you with IT issues, academic procedures, campus information, student services, and general university guidance. What specific area would you like assistance with?"
+        return jsonify({"output": response})
+    
+    user_memory = get_user_memory(user_id)
+    
+    # Create agent executor with strict limits
     user_agent_executor = AgentExecutor.from_agent_and_tools(
         agent=agent,
         tools=tools,
         verbose=True,
-        memory=user_memory
+        memory=user_memory,
+        max_iterations=3,
+        max_execution_time=20,  # 20 seconds max
+        early_stopping_method="generate"
     )
     
     try:
-        output = await user_agent_executor.arun({"input": user_query})
+        # Use synchronous run instead of arun
+        output = user_agent_executor.run(input=user_query)
+        
+        # Validate output before returning
+        if not output or output.strip() == "":
+            raise ValueError("Empty response generated")
+        
+        if "Agent stopped due to iteration limit" in output:
+            raise TimeoutError("Agent exceeded iteration limit")
+        
+        if "Agent stopped due to time limit" in output:
+            raise TimeoutError("Agent exceeded time limit")
+        
         return jsonify({"output": output})
+        
+    except TimeoutError as e:
+        print(f"Timeout error: {e}")
+        # Don't save to memory, throw proper error
+        return jsonify({
+            "error": "Request timeout - please try asking a more specific question",
+            "error_type": "timeout"
+        }), 408
+        
+    except ValueError as e:
+        print(f"Value error: {e}")
+        return jsonify({
+            "error": "Unable to generate a valid response - please rephrase your question",
+            "error_type": "invalid_response"
+        }), 422
+        
     except Exception as e:
-        print(f"Error in chat route: {e}")
-        return jsonify({"error": "An error occurred while processing your request."}), 500
+        print(f"Unexpected error in chat route: {e}")
+        # For any other errors, don't save to memory
+        return jsonify({
+            "error": "I'm experiencing technical difficulties. Please try again in a moment.",
+            "error_type": "system_error"
+        }), 500
 
 
 if __name__ == "__main__":
