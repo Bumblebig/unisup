@@ -1,0 +1,9 @@
+langchain-community==0.2.1
+langchain-openai==0.1.8
+openai>=1.30.4
+pinecone>=3.0.0
+python-dotenv>=1.0.1
+langchain==0.2.1
+flask[async]
+flask_cors
+gunicorn
