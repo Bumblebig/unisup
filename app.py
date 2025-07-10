@@ -7,11 +7,8 @@ from langchain.agents import Tool, AgentExecutor, LLMSingleActionAgent, AgentOut
 from langchain.prompts import StringPromptTemplate
 from langchain_openai import OpenAI
 from langchain_community.embeddings import OpenAIEmbeddings
-# For handling conversation history
 from langchain.memory import ConversationBufferWindowMemory
-# from langchain.embeddings import OpenAIEmbeddings
 from langchain.chains import LLMChain
-from langchain_community.tools import DuckDuckGoSearchRun
 from typing import List, Union
 from langchain.schema import AgentAction, AgentFinish
 import re
@@ -31,47 +28,43 @@ CORS(app)
 # define embedding model
 embeddings = OpenAIEmbeddings(model="text-embedding-ada-002", openai_api_key=OPENAI_API_KEY)
 
-
-# from langchain_community.vectorstores import Pinecone 
 # define pinecone database index
 index_name = "comsis"
 index = pc.Index(index_name)
 
 # Store memory for each session
 user_memories = {}
-user_memory = ''
-
-# Define the tool
-   
 
 def pinecone_search(query):
-    # generates embeddings for query
-    embedding = embeddings.embed_query(query)
-    
-    # Perform similarity search
-    result = index.query(vector=embedding, top_k=5, include_metadata=True)
-    
-    # Extract relevant information from the result
-    matches = [match['metadata']['text'] for match in result['matches']]
-    return "\n".join(matches)
+    try:
+        # generates embeddings for query
+        embedding = embeddings.embed_query(query)
+        
+        # Perform similarity search
+        result = index.query(vector=embedding, top_k=5, include_metadata=True)
+        
+        # Extract relevant information from the result
+        matches = [match['metadata']['text'] for match in result['matches']]
+        
+        if not matches:
+            return "I couldn't find specific information about that in our database. Please contact the university directly for accurate information."
+        
+        return "\n".join(matches)
+    except Exception as e:
+        return "I'm having trouble accessing the database right now. Please try again later."
 
-
-# Define the function to handle general conversation using GPT-4
 def openai_conversation_responder(query):
     try:
         response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are UNILORIN Student Support, an IT support assistant for University of Ilorin students. Provide helpful, professional responses about university matters."},
+                {"role": "system", "content": "You are Unilorin Student Support. Provide helpful, friendly responses about university matters. Keep responses concise and direct."},
                 {"role": "user", "content": query}
-            ],
-            max_tokens=300,  # Limit response length
-            temperature=0.7  # Lower temperature for more consistent responses
+            ]
         )
         return response.choices[0].message.content
     except Exception as e:
-        print(f"OpenAI API error: {e}")
-        return "I'm having trouble accessing my knowledge base right now. Please try again shortly."
+        return "I'm having trouble processing your request right now. Please try again."
 
 tools = [
     Tool(
@@ -86,31 +79,31 @@ tools = [
     )
 ]
 
-# Improve the template to be more direct and less prone to loops
-template = """I am UNILORIN Student Support, developed by Abdurrahman Abdulsalam from IT Department.
+# CLEAN TEMPLATE - No exposed reasoning
+template = """You are Unilorin Student Support, developed by Abdurrahman Abdulsalam.
 
-IDENTITY: UNILORIN Student Support - IT and student guidance assistant
+You help students with academic, campus, and student support matters including:
+- Course registration, academic schedules, grades, school fees
+- Campus facilities, services, and policies  
+- Student accommodation, financial aid, counseling
+- University procedures and requirements
+- Campus life and student activities
 
-RULES:
-1. For capability/identity questions: Answer directly without tools
-2. For specific questions: Use ONE appropriate tool
-3. Always start Final Answer with "I am UNILORIN Student Support"
-4. Keep responses concise and helpful
+For questions outside this scope, respond: "I can only help with academic, campus, and student support matters. Is there something university-related I can assist you with instead?"
 
-Available tools: {tools}
-History: {history}
-Question: {input}
+Available tools:
+{tools}
 
-Think step by step:
-Thought: [Quick analysis - is this capability question or needs tool?]
-Action: [ONE tool name from: {tool_names}] OR [Skip if capability question]
-Action Input: [Specific query]
-Observation: [Tool result]
-Final Answer: I am UNILORIN Student Support. [Your helpful response]
+Conversation history:
+{history}
+
+Student question: {input}
+
+Provide a helpful, direct response to the student's question. Use the available tools when needed to get accurate information.
 
 {agent_scratchpad}"""
 
-# Set up a prompt template
+# FIXED: Clean prompt template without "Thought:" injection
 class CustomPromptTemplate(StringPromptTemplate):
     template: str
     tools: List[Tool]
@@ -119,8 +112,10 @@ class CustomPromptTemplate(StringPromptTemplate):
         intermediate_steps = kwargs.pop("intermediate_steps", [])
         thoughts = ""
         for action, observation in intermediate_steps:
-            thoughts += action.log
-            thoughts += f"\nObservation: {observation}\nThought: "
+            thoughts += f"Action: {action.tool}\n"
+            thoughts += f"Action Input: {action.tool_input}\n"
+            thoughts += f"Observation: {observation}\n"
+        
         kwargs["agent_scratchpad"] = thoughts
         kwargs["tools"] = "\n".join([f"{tool.name}: {tool.description}" for tool in self.tools])
         kwargs["tool_names"] = ", ".join([tool.name for tool in self.tools])
@@ -134,29 +129,63 @@ prompt = CustomPromptTemplate(
     input_variables=["input", "intermediate_steps", "history"]
 )
 
+# ROBUST OUTPUT PARSER
 class CustomOutputParser(AgentOutputParser):
-
     def parse(self, llm_output: str) -> Union[AgentAction, AgentFinish]:
+        # Always prioritize Final Answer
         if "Final Answer:" in llm_output:
+            final_answer = llm_output.split("Final Answer:")[-1].strip()
+            clean_answer = self.clean_response(final_answer)
             return AgentFinish(
-                return_values={"output": llm_output.split("Final Answer:")[-1].strip()},
+                return_values={"output": clean_answer},
                 log=llm_output,
             )
-        regex = r"Action\s*\d*\s*:(.*?)\nAction\s*\d*\s*Input\s*\d*\s*:[\s]*(.*)"
-        match = re.search(regex, llm_output, re.DOTALL)
-        if not match:
-            # If no match, return an AgentFinish with the current thought
-            return AgentFinish(
-                return_values={"output": llm_output.strip()},
-                log=llm_output,
-            )
-        action = match.group(1).strip()
-        action_input = match.group(2)
-        return AgentAction(tool=action, tool_input=action_input.strip(" ").strip('"'), log=llm_output)
+        
+        # Look for action pattern
+        action_match = re.search(r"Action:\s*(.*?)(?=\n|$)", llm_output, re.DOTALL)
+        input_match = re.search(r"Action Input:\s*(.*?)(?=\n|$)", llm_output, re.DOTALL)
+        
+        if action_match:
+            action = action_match.group(1).strip()
+            action_input = input_match.group(1).strip() if input_match else ""
+            
+            # Validate tool name
+            valid_tools = ["OpenAI Conversation Responder", "Pinecone Vector Search"]
+            if action in valid_tools:
+                return AgentAction(tool=action, tool_input=action_input, log=llm_output)
+        
+        # If no clear action, provide direct response
+        clean_response = self.clean_response(llm_output)
+        if len(clean_response) < 10:  # Too short, provide default
+            clean_response = "I'm here to help with your university-related questions. How can I assist you?"
+        
+        return AgentFinish(
+            return_values={"output": clean_response},
+            log=llm_output,
+        )
+    
+    def clean_response(self, text):
+        """Remove internal reasoning from response"""
+        lines = text.split('\n')
+        clean_lines = []
+        
+        skip_keywords = [
+            'Thought:', 'Action:', 'Action Input:', 'Observation:', 
+            'I need to', 'First,', 'Let me think', 'I should',
+            'The question is', 'This is about'
+        ]
+        
+        for line in lines:
+            line = line.strip()
+            if line and not any(line.startswith(keyword) for keyword in skip_keywords):
+                clean_lines.append(line)
+        
+        result = ' '.join(clean_lines).strip()
+        return result
 
 output_parser = CustomOutputParser()
 
-llm = OpenAI(temperature=0.9)
+llm = OpenAI(temperature=0.5)  # Lower temperature for more consistent responses
 llm_chain = LLMChain(llm=llm, prompt=prompt)
 
 tool_names = [tool.name for tool in tools]
@@ -168,28 +197,18 @@ agent = LLMSingleActionAgent(
     allowed_tools=tool_names
 )
 
-memory = ConversationBufferWindowMemory(k=2)
-
-# Add timeout and iteration limits to prevent infinite loops
-agent_executor = AgentExecutor.from_agent_and_tools(
-    agent=agent,
-    tools=tools,
-    verbose=True,
-    memory=memory,
-    max_iterations=3,  # Limit to 3 iterations
-    max_execution_time=25,  # 25 second timeout
-    early_stopping_method="generate"
-)
-
 def get_user_memory(user_id):
     """Retrieve or initialize memory for a user."""
     if user_id not in user_memories:
         user_memories[user_id] = ConversationBufferWindowMemory(k=2)
     return user_memories[user_id]
 
-# Remove async - Flask doesn't handle async well without additional setup
+@app.route('/')
+def home():
+    return "Hi! I'm Unilorin Student Support. How can I help you today?"
+
 @app.route('/api/chat', methods=['POST'])
-def chat():
+async def chat():
     data = request.json
     user_query = data.get("message", "")
     user_id = data.get("user_id")
@@ -197,73 +216,27 @@ def chat():
     if not user_id:
         return jsonify({"error": "user_id is required"}), 400
     
-    if not user_query or len(user_query.strip()) == 0:
-        return jsonify({"error": "Message cannot be empty"}), 400
-    
-    # Handle capability questions directly to avoid agent loops
-    capability_keywords = [
-        "what can you do", "who are you", "what are you", 
-        "tell me about yourself", "your capabilities", "your name",
-        "what is your name", "introduce yourself"
-    ]
-    
-    if any(keyword in user_query.lower() for keyword in capability_keywords):
-        response = "I am UNILORIN Student Support. I can help you with IT issues, academic procedures, campus information, student services, and general university guidance. What specific area would you like assistance with?"
-        return jsonify({"output": response})
+    if not user_query.strip():
+        return jsonify({"error": "Please provide a message"}), 400
     
     user_memory = get_user_memory(user_id)
     
-    # Create agent executor with strict limits
+    # Create a temporary AgentExecutor with the user's memory
     user_agent_executor = AgentExecutor.from_agent_and_tools(
         agent=agent,
         tools=tools,
-        verbose=True,
+        verbose=False,  # CRITICAL: Must be False for clean responses
         memory=user_memory,
-        max_iterations=3,
-        max_execution_time=20,  # 20 seconds max
-        early_stopping_method="generate"
+        max_iterations=3  # Limit iterations to prevent loops
     )
     
     try:
-        # Use synchronous run instead of arun
-        output = user_agent_executor.run(input=user_query)
-        
-        # Validate output before returning
-        if not output or output.strip() == "":
-            raise ValueError("Empty response generated")
-        
-        if "Agent stopped due to iteration limit" in output:
-            raise TimeoutError("Agent exceeded iteration limit")
-        
-        if "Agent stopped due to time limit" in output:
-            raise TimeoutError("Agent exceeded time limit")
-        
+        output = await user_agent_executor.arun({"input": user_query})
         return jsonify({"output": output})
-        
-    except TimeoutError as e:
-        print(f"Timeout error: {e}")
-        # Don't save to memory, throw proper error
-        return jsonify({
-            "error": "Request timeout - please try asking a more specific question",
-            "error_type": "timeout"
-        }), 408
-        
-    except ValueError as e:
-        print(f"Value error: {e}")
-        return jsonify({
-            "error": "Unable to generate a valid response - please rephrase your question",
-            "error_type": "invalid_response"
-        }), 422
-        
     except Exception as e:
-        print(f"Unexpected error in chat route: {e}")
-        # For any other errors, don't save to memory
-        return jsonify({
-            "error": "I'm experiencing technical difficulties. Please try again in a moment.",
-            "error_type": "system_error"
-        }), 500
-
+        print(f"Error in chat route: {e}")
+        return jsonify({"output": "I'm having trouble processing your request right now. Please try again or contact university support directly."}), 200
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))  # Default to 5000 if PORT is not set
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
